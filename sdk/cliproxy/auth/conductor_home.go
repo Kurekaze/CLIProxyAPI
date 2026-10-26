@@ -10,11 +10,12 @@ import (
 	"sync"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -343,14 +344,50 @@ func repeatedHomeAuthError() *Error {
 }
 
 type homeAuthDispatchResponse struct {
-	Model         string `json:"model"`
-	Provider      string `json:"provider"`
-	AuthIndex     string `json:"auth_index"`
-	UserAPIKey    string `json:"user_api_key"`
-	RequestRetry  *int   `json:"request_retry,omitempty"`
-	ForceMapping  bool   `json:"force_mapping"`
-	OriginalAlias string `json:"original_alias"`
-	Auth          Auth   `json:"auth"`
+	Model         string                 `json:"model"`
+	Provider      string                 `json:"provider"`
+	AuthIndex     string                 `json:"auth_index"`
+	UserAPIKey    string                 `json:"user_api_key"`
+	RequestRetry  *int                   `json:"request_retry,omitempty"`
+	ForceMapping  bool                   `json:"force_mapping"`
+	OriginalAlias string                 `json:"original_alias"`
+	ModelInfo     *homeDispatchModelInfo `json:"model_info,omitempty"`
+	Auth          Auth                   `json:"auth"`
+}
+
+type homeDispatchModelInfo struct {
+	ID                         string                       `json:"id"`
+	Type                       string                       `json:"type,omitempty"`
+	InputTokenLimit            int                          `json:"inputTokenLimit,omitempty"`
+	OutputTokenLimit           int                          `json:"outputTokenLimit,omitempty"`
+	ContextLength              int                          `json:"context_length,omitempty"`
+	MaxCompletionTokens        int                          `json:"max_completion_tokens,omitempty"`
+	Thinking                   *registry.ThinkingSupport    `json:"thinking,omitempty"`
+	NativeCapabilities         *registry.NativeCapabilities `json:"native_capabilities,omitempty"`
+	SupportConfigurationUpdate *bool                        `json:"support_configuration_update,omitempty"`
+	UserDefined                bool                         `json:"user_defined"`
+}
+
+func (m *homeDispatchModelInfo) registryModelInfo() *registry.ModelInfo {
+	if m == nil || strings.TrimSpace(m.ID) == "" {
+		return nil
+	}
+	return &registry.ModelInfo{
+		ID:                         strings.TrimSpace(m.ID),
+		Type:                       strings.TrimSpace(m.Type),
+		InputTokenLimit:            m.InputTokenLimit,
+		OutputTokenLimit:           m.OutputTokenLimit,
+		ContextLength:              m.ContextLength,
+		MaxCompletionTokens:        m.MaxCompletionTokens,
+		Thinking:                   m.Thinking,
+		NativeCapabilities:         m.NativeCapabilities,
+		SupportConfigurationUpdate: m.SupportConfigurationUpdate != nil && *m.SupportConfigurationUpdate,
+		UserDefined:                m.UserDefined,
+	}
+}
+
+type homeDispatchSessionHierarchyDispatcher interface {
+	RPopAuthWithSessionHierarchy(ctx context.Context, requestedModel string, sessionID string, parentSessionID string, headers http.Header, count int, credentialPolicy string, retryRound *int, excludedAuthIDs []string, pinnedAuthID string) ([]byte, error)
 }
 
 type homeAuthDispatcher interface {
@@ -964,12 +1001,39 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		return nil, &Error{Code: "home_unavailable", Message: "home execution registry unavailable", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
 	}
 
-	sessionID := m.homeDispatchSessionID(opts)
+	if opts.Metadata != nil {
+		if opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] == nil && requestedModel != "" {
+			opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = requestedModel
+		}
+	}
+	sessionID, parentSessionID := m.homeDispatchSessionIDs(opts)
+	if sessionID != "" && opts.Metadata != nil {
+		opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = sessionID
+		if parentSessionID != "" {
+			opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = parentSessionID
+		} else {
+			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+		}
+	}
 	dispatchHeaders := homeDispatchHeaders(ctx, opts.Headers)
+	if opts.Metadata != nil {
+		if nodeKind, ok := opts.Metadata[cliproxyexecutor.NodeKindMetadataKey].(string); ok && strings.TrimSpace(nodeKind) != "" {
+			if dispatchHeaders == nil {
+				dispatchHeaders = make(http.Header)
+			}
+			dispatchHeaders.Set("X-Node-Kind", strings.TrimSpace(nodeKind))
+		}
+	}
 	credentialPolicy := credentialPolicyFromContext(ctx)
 	var raw []byte
 	var errRPop error
-	if credentialPolicy == "" {
+	if hierarchyClient, okHierarchy := client.(homeDispatchSessionHierarchyDispatcher); okHierarchy {
+		var retryRoundPtr *int
+		if retryRound >= 0 {
+			retryRoundPtr = &retryRound
+		}
+		raw, errRPop = hierarchyClient.RPopAuthWithSessionHierarchy(ctx, requestedModel, sessionID, parentSessionID, dispatchHeaders, homeAuthCountFromMetadata(opts.Metadata), credentialPolicy, retryRoundPtr, excludedAuthIDList, pinnedAuthID)
+	} else if credentialPolicy == "" {
 		if retryRoundClient, okRetryRound := client.(homeDispatchRetryRoundConstraintsDispatcher); okRetryRound {
 			raw, errRPop = retryRoundClient.RPopAuthWithRetryRoundConstraints(ctx, requestedModel, sessionID, dispatchHeaders, homeAuthCountFromMetadata(opts.Metadata), retryRound, excludedAuthIDList, pinnedAuthID)
 		} else if constrainedClient, okConstraints := client.(homeDispatchConstraintsDispatcher); okConstraints {
@@ -1147,6 +1211,10 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		endScope()
 		return nil, &Error{Code: "home_unavailable", Message: "home execution registry unavailable", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selection.modelInfo = dispatch.ModelInfo.registryModelInfo()
+	if dispatch.ModelInfo != nil {
+		selection.configurationUpdateSupport = dispatch.ModelInfo.SupportConfigurationUpdate
+	}
 	if pinnedAuthID == "" && dispatch.RequestRetry != nil && *dispatch.RequestRetry >= 0 {
 		selection.requestRetry = *dispatch.RequestRetry
 		selection.hasRequestRetry = true
@@ -1160,6 +1228,8 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 			return nil, errEnd
 		}
 	}
+	selection.CanonicalSessionID = sessionID
+	selection.ParentSessionID = parentSessionID
 	return selection, nil
 }
 
@@ -1227,7 +1297,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
-		executor, ok := m.executors[providerKey]
+		executor, ok := m.executorLocked(providerKey)
 		if !ok {
 			continue
 		}
@@ -1239,6 +1309,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	}
 	m.mu.RUnlock()
 
+	now := time.Now()
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
@@ -1248,6 +1319,10 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		}
 		if okHint && hint.Known {
 			if !hint.Available {
+				if IsAntigravityCreditsHintFresh(hint, now) {
+					continue
+				}
+				unknown = append(unknown, candidate)
 				continue
 			}
 			known = append(known, candidate)
@@ -1351,8 +1426,10 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
+			executionSeq := m.nextExecutionSeq()
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
-			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts}
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts, CredentialVersion: c.auth.CredentialVersion, RegistrationEpoch: c.auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -1408,6 +1485,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
+		creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
 		if errStream != nil {
 			continue
