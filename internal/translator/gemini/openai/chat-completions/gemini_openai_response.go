@@ -165,6 +165,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	} else if pendingUsage := gjson.GetBytes(rawJSON, "cpaUsageMetadata"); pendingUsage.Exists() {
 		p.PendingUsageMetadata = append(p.PendingUsageMetadata[:0], pendingUsage.Raw...)
 	}
+	baseTemplate = applyGeminiOpenAIPromptFeedback(baseTemplate, rawJSON)
 
 	var responseStrings [][]byte
 	candidates := gjson.GetBytes(rawJSON, "candidates")
@@ -178,6 +179,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			// Set the specific index for this candidate.
 			candidateIndex := int(candidate.Get("index").Int())
 			template, _ = sjson.SetBytes(template, "choices.0.index", candidateIndex)
+			template = applyGeminiOpenAISafetyEvidence(template, "choices.0.", candidate)
 
 			if finishReasonResult := candidate.Get("finishReason"); finishReasonResult.Exists() {
 				p.UpstreamFinishReason[candidateIndex] = strings.ToUpper(finishReasonResult.String())
@@ -302,8 +304,8 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			return true // continue loop
 		})
 	} else {
-		// If there are no candidates (e.g., a pure usageMetadata chunk), return the usage chunk if present.
-		if gjson.GetBytes(rawJSON, "usageMetadata").Exists() && len(responseStrings) == 0 {
+		// If there are no candidates (e.g., a pure usageMetadata or promptFeedback chunk), return it if present.
+		if (gjson.GetBytes(rawJSON, "usageMetadata").Exists() || gjson.GetBytes(rawJSON, "promptFeedback").Exists()) && len(responseStrings) == 0 {
 			chunk := append([]byte(nil), baseTemplate...)
 			if upstreamFinishReason := p.UpstreamFinishReason[0]; upstreamFinishReason != "" && !p.SawFinishReason[0] {
 				p.SawFinishReason[0] = true
@@ -379,6 +381,8 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 		}
 	}
 
+	template = applyGeminiOpenAIPromptFeedback(template, rawJSON)
+
 	// Process the main content part of the response for all candidates.
 	candidates := gjson.GetBytes(rawJSON, "candidates")
 	if candidates.IsArray() {
@@ -389,6 +393,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 
 			// Set the index for this choice.
 			choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "index", candidate.Get("index").Int())
+			choiceTemplate = applyGeminiOpenAISafetyEvidence(choiceTemplate, "", candidate)
 
 			// Set finish reason.
 			if finishReasonResult := candidate.Get("finishReason"); finishReasonResult.Exists() {
@@ -540,6 +545,25 @@ func applyGeminiOpenAIUsageMetadata(template []byte, usageResult gjson.Result) [
 		if err != nil {
 			log.Warnf("gemini openai response: failed to set cached_tokens in streaming: %v", err)
 		}
+	}
+	return template
+}
+
+// applyGeminiOpenAISafetyEvidence keeps upstream safety details for diagnostic clients.
+// prefix is the choice path inside template ("choices.0." for chunks, "" for a bare choice).
+func applyGeminiOpenAISafetyEvidence(template []byte, prefix string, candidate gjson.Result) []byte {
+	for _, field := range []string{"safetyRatings", "finishMessage"} {
+		if value := candidate.Get(field); value.Exists() {
+			template, _ = sjson.SetRawBytes(template, prefix+field, []byte(value.Raw))
+		}
+	}
+	return template
+}
+
+// applyGeminiOpenAIPromptFeedback keeps prompt-level block details for diagnostic clients.
+func applyGeminiOpenAIPromptFeedback(template, rawJSON []byte) []byte {
+	if feedback := gjson.GetBytes(rawJSON, "promptFeedback"); feedback.Exists() {
+		template, _ = sjson.SetRawBytes(template, "promptFeedback", []byte(feedback.Raw))
 	}
 	return template
 }
